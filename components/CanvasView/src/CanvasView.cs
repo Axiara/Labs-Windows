@@ -14,6 +14,7 @@ namespace CommunityToolkit.WinUI.Controls;
 /// It which provides built-in support for presenting a collection of items bound to specific coordinates 
 /// and drag-and-drop support of those items.
 /// </summary>
+/// 
 public partial class CanvasView : ItemsControl
 {
     private (DependencyProperty, string)[] LiftedProperties = new (DependencyProperty, string)[] {
@@ -23,10 +24,30 @@ public partial class CanvasView : ItemsControl
         (ManipulationModeProperty, "ManipulationMode")
     };
 
+    public Rect ContentBounds
+    {
+        get => (Rect)GetValue(ContentBoundsProperty);
+        private set => SetValue(ContentBoundsProperty, value);
+    }
+    public static readonly DependencyProperty ContentBoundsProperty =
+        DependencyProperty.Register(nameof(ContentBounds), typeof(Rect), typeof(CanvasView),
+            new PropertyMetadata(new Rect(0, 0, 0, 0)));
+
+    public Point ContentOffset
+    {
+        get => (Point)GetValue(ContentOffsetProperty);
+        private set => SetValue(ContentOffsetProperty, value);
+    }
+    public static readonly DependencyProperty ContentOffsetProperty =
+        DependencyProperty.Register(nameof(ContentOffset), typeof(Point), typeof(CanvasView),
+            new PropertyMetadata(new Point(0, 0)));
+
+
     public CanvasView()
     {
-        // TODO: Need to use XamlReader because of https://github.com/microsoft/microsoft-ui-xaml/issues/2898
-        ItemsPanel = XamlReader.Load("<ItemsPanelTemplate xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\"><Canvas/></ItemsPanelTemplate>") as ItemsPanelTemplate;
+        // ItemsPanel is provided by the default style in Themes/Generic.xaml.
+        // This avoids WinUI 3 runtime XamlReader.Load limitations with custom types.
+        DefaultStyleKey = typeof(CanvasView);
     }
 
     protected override void PrepareContainerForItemOverride(DependencyObject element, object item)
@@ -44,7 +65,6 @@ public partial class CanvasView : ItemsControl
             // Loaded is not firing when dynamically loading an element to the collection. Relay on CompositionTargetHelper above.
             // Seems like a bug in Loaded event?
             cp.Loaded += ContentPresenter_Loaded;
-            cp.ManipulationDelta += ContentPresenter_ManipulationDelta;
         }
 
         // TODO: Do we want to support something else in a custom template?? else if (item is FrameworkElement fe && fe.FindDescendant/GetContentControl?)
@@ -56,26 +76,12 @@ public partial class CanvasView : ItemsControl
 
         if (element is ContentPresenter cp)
         {
+            if (CanvasViewPanel.GetPositioningElement(cp) is UIElement root)
+            {
+                UnhookDragHandlers(root);
+            }
+
             cp.Loaded -= ContentPresenter_Loaded;
-            cp.ManipulationDelta -= ContentPresenter_ManipulationDelta;
-        }
-    }
-
-#if NET8_0_OR_GREATER
-    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "These use of 'SetBindingExpressionValue' might be fine (we should revisit this later)")]
-#endif
-    private void ContentPresenter_ManipulationDelta(object sender, ManipulationDeltaRoutedEventArgs e)
-    {
-        // Move the rectangle.
-        if (sender is ContentPresenter cp)
-        {
-            // TODO: Seeing some drift, not sure if due to DPI or just general drift
-            // or probably we need to do the start/from delta approach we did with SizerBase to resolve.
-
-            // We know that most likely these values have been bound to a data model object of some sort
-            // Therefore, we need to use this helper to update the underlying model value of our bound property.
-            cp.SetBindingExpressionValue(Canvas.LeftProperty, Canvas.GetLeft(cp) + e.Delta.Translation.X);
-            cp.SetBindingExpressionValue(Canvas.TopProperty, Canvas.GetTop(cp) + e.Delta.Translation.Y);
         }
     }
 
@@ -91,23 +97,281 @@ public partial class CanvasView : ItemsControl
 
     private void SetupChildBinding(ContentPresenter cp)
     {
-        // Get direct visual descendant for ContentPresenter to look for Canvas properties within Template.
-        var child = VisualTreeHelper.GetChild(cp, 0);
-
-        if (child != null)
+        int count = VisualTreeHelper.GetChildrenCount(cp);
+        if (count <= 0)
         {
-            // TODO: Should we avoid doing this twice?
+            _ = CompositionTargetHelper.ExecuteAfterCompositionRenderingAsync(() => SetupChildBinding(cp));
+            return;
+        }
 
-            // Hook up any properties we care about from the templated children to it's parent ContentPresenter.
-            foreach ((var prop, var path) in LiftedProperties)
-            {
-                var binding = new Binding();
-                binding.Source = child;
-                ////binding.Mode = BindingMode.TwoWay; // TODO: Should this be exposed as a general property?
-                binding.Path = new PropertyPath(path);
+        DependencyObject child = VisualTreeHelper.GetChild(cp, 0);
 
-                cp.SetBinding(prop, binding);
-            }
+        // Tell the items host to read Canvas.Left/Top from the template root (or first realized visual).
+        CanvasViewPanel.SetPositioningElement(cp, child);
+
+        if (child is UIElement root)
+        {
+            HookDragHandlers(root);
+        }
+
+        // TODO: Should we avoid doing this twice?
+
+        // Hook up any properties we care about from the templated children to it's parent ContentPresenter.
+        foreach ((var prop, var path) in LiftedProperties)
+        {
+            var binding = new Binding();
+            binding.Source = child;
+            ////binding.Mode = BindingMode.TwoWay; // TODO: Should this be exposed as a general property?
+            binding.Path = new PropertyPath(path);
+
+            cp.SetBinding(prop, binding);
+        }
+        
+    }
+
+    private sealed class DragSession
+    {
+        public DragSession(UIElement target, Point startPointerView, double startLeft, double startTop)
+        {
+            Target = target;
+            StartPointerView = startPointerView;
+            StartLeft = startLeft;
+            StartTop = startTop;
+        }
+
+        public UIElement Target { get; }
+        public Point StartPointerView { get; }
+        public double StartLeft { get; }
+        public double StartTop { get; }
+    }
+
+    private readonly HashSet<UIElement> _dragTargets = new();
+    private readonly Dictionary<uint, DragSession> _drags = new();
+
+    private void HookDragHandlers(UIElement root)
+    {
+        if (!_dragTargets.Add(root))
+        {
+            return;
+        }
+
+        root.PointerPressed += OnItemPointerPressed;
+        root.PointerMoved += OnItemPointerMoved;
+        root.PointerReleased += OnItemPointerReleased;
+        root.PointerCanceled += OnItemPointerCanceled;
+        root.PointerCaptureLost += OnItemPointerCaptureLost;
+
+        if (root is FrameworkElement fe)
+        {
+            fe.Unloaded += OnItemUnloaded;
         }
     }
+
+    private void UnhookDragHandlers(UIElement root)
+    {
+        if (!_dragTargets.Remove(root))
+        {
+            return;
+        }
+
+        root.PointerPressed -= OnItemPointerPressed;
+        root.PointerMoved -= OnItemPointerMoved;
+        root.PointerReleased -= OnItemPointerReleased;
+        root.PointerCanceled -= OnItemPointerCanceled;
+        root.PointerCaptureLost -= OnItemPointerCaptureLost;
+
+        if (root is FrameworkElement fe)
+        {
+            fe.Unloaded -= OnItemUnloaded;
+        }
+    }
+
+    private void OnItemUnloaded(object sender, RoutedEventArgs e)
+    {
+        if (sender is UIElement root)
+        {
+            UnhookDragHandlers(root);
+        }
+    }
+
+    private Point ViewToHost(Point viewPoint)
+    {
+        if (_itemsHost is null)
+        {
+            return viewPoint;
+        }
+
+        GeneralTransform transform = TransformToVisual(_itemsHost);
+        return transform.TransformPoint(viewPoint);
+    }
+
+    private Point ViewToWorld(Point viewPoint)
+    {
+        Point hostPoint = ViewToHost(viewPoint);
+
+        if (_itemsHost is null)
+        {
+            return hostPoint;
+        }
+
+        Point offset = _itemsHost.ContentOffset;
+        return new Point(hostPoint.X - offset.X, hostPoint.Y - offset.Y);
+    }
+
+    private static double ReadCanvasLeft(UIElement element)
+    {
+        double value = Canvas.GetLeft(element);
+        return double.IsNaN(value) ? 0 : value;
+    }
+
+    private static double ReadCanvasTop(UIElement element)
+    {
+        double value = Canvas.GetTop(element);
+        return double.IsNaN(value) ? 0 : value;
+    }
+
+#if NET8_0_OR_GREATER
+    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "These uses of 'SetBindingExpressionValue' might be fine (we should revisit this later)")]
+#endif
+    private static void SetCanvasLeft(UIElement element, double value)
+    {
+        if (element is FrameworkElement fe)
+        {
+            fe.SetBindingExpressionValue(Canvas.LeftProperty, value);
+        }
+        else
+        {
+            Canvas.SetLeft(element, value);
+        }
+    }
+
+#if NET8_0_OR_GREATER
+    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "These uses of 'SetBindingExpressionValue' might be fine (we should revisit this later)")]
+#endif
+    private static void SetCanvasTop(UIElement element, double value)
+    {
+        if (element is FrameworkElement fe)
+        {
+            fe.SetBindingExpressionValue(Canvas.TopProperty, value);
+        }
+        else
+        {
+            Canvas.SetTop(element, value);
+        }
+    }
+
+    private void OnItemPointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (sender is not UIElement target)
+        {
+            return;
+        }
+
+        var point = e.GetCurrentPoint(this);
+
+        // Require left button/primary contact.
+        if (!point.Properties.IsLeftButtonPressed)
+        {
+            return;
+        }
+
+        target.CapturePointer(e.Pointer);
+
+        Point startPointerView = point.Position;
+
+        double startLeft = ReadCanvasLeft(target);
+        double startTop = ReadCanvasTop(target);
+
+        _drags[e.Pointer.PointerId] = new DragSession(target, startPointerView, startLeft, startTop);
+
+        e.Handled = true;
+    }
+
+    private void OnItemPointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_drags.TryGetValue(e.Pointer.PointerId, out DragSession? drag))
+        {
+            return;
+        }
+
+        Point startPointerWorld = ViewToWorld(drag.StartPointerView);
+        Point currentPointerWorld = ViewToWorld(e.GetCurrentPoint(this).Position);
+
+        double dx = currentPointerWorld.X - startPointerWorld.X;
+        double dy = currentPointerWorld.Y - startPointerWorld.Y;
+
+        SetCanvasLeft(drag.Target, drag.StartLeft + dx);
+        SetCanvasTop(drag.Target, drag.StartTop + dy);
+
+        e.Handled = true;
+    }
+
+    private void OnItemPointerReleased(object sender, PointerRoutedEventArgs e) => EndDrag(e);
+    private void OnItemPointerCanceled(object sender, PointerRoutedEventArgs e) => EndDrag(e);
+    private void OnItemPointerCaptureLost(object sender, PointerRoutedEventArgs e) => EndDrag(e);
+
+    private void EndDrag(PointerRoutedEventArgs e)
+    {
+        if (_drags.TryGetValue(e.Pointer.PointerId, out DragSession? drag))
+        {
+            drag.Target.ReleasePointerCapture(e.Pointer);
+            _drags.Remove(e.Pointer.PointerId);
+            _itemsHost?.InvalidateMeasure();
+        }
+    }
+
+    private CanvasViewPanel? _itemsHost;
+
+    protected override void OnApplyTemplate()
+    {
+        base.OnApplyTemplate();
+
+        // Detach old
+        if (_itemsHost is not null)
+        {
+            _itemsHost.ContentBoundsChanged -= OnHostBoundsChanged;
+        }
+
+        _itemsHost = FindDescendant<CanvasViewPanel>(this);
+        if (_itemsHost is not null)
+        {
+            _itemsHost.ContentBoundsChanged += OnHostBoundsChanged;
+
+            // Critical: ensure no content-anchored clip survives:
+            _itemsHost.Clip = null;
+
+            SyncBoundsFromHost();
+        }
+    }
+
+    private void OnHostBoundsChanged(object? sender, EventArgs e) => SyncBoundsFromHost();
+
+    private void SyncBoundsFromHost()
+    {
+        if (_itemsHost is null) return;
+        ContentBounds = _itemsHost.ContentBounds;
+        ContentOffset = _itemsHost.ContentOffset;
+    }
+
+    private static T? FindDescendant<T>(DependencyObject root) where T : DependencyObject
+    {
+        int count = VisualTreeHelper.GetChildrenCount(root);
+        for (int i = 0; i < count; i++)
+        {
+            DependencyObject child = VisualTreeHelper.GetChild(root, i);
+            if (child is T typed)
+            {
+                return typed;
+            }
+
+            T? nested = FindDescendant<T>(child);
+            if (nested is not null)
+            {
+                return nested;
+            }
+        }
+
+        return default;
+    }
+
 }

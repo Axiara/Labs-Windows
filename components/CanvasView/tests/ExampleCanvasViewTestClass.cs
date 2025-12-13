@@ -78,6 +78,27 @@ public partial class ExampleCanvasViewTestClass : VisualUITestBase
         Assert.IsNotNull(component);
     }
 
+    [UIThreadTestMethod]
+    public async Task CanvasView_UsesCanvasViewPanelItemsHost()
+    {
+        var component = new CanvasView();
+        component.Items.Add(new Border { Width = 10, Height = 10 });
+
+        await LoadTestContentAsync(component);
+
+        try
+        {
+            await CompositionTargetHelper.ExecuteAfterCompositionRenderingAsync(() => { });
+
+            var itemsHost = component.FindDescendant<CanvasViewPanel>();
+            Assert.IsNotNull(itemsHost, "CanvasViewPanel items host was not found. Ensure the default style is applied and sets ItemsPanel to CanvasViewPanel.");
+        }
+        finally
+        {
+            await UnloadTestContentAsync(component);
+        }
+    }
+
     //// ----------------------------- ADVANCED TEST SCENARIOS -----------------------------
 
     // If you need to use DataRow, you can use this pattern with the UI dispatch still.
