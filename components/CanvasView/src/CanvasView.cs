@@ -294,11 +294,25 @@ public partial class CanvasView : ItemsControl
             return;
         }
 
-        Point startPointerWorld = ViewToWorld(drag.StartPointerView);
-        Point currentPointerWorld = ViewToWorld(e.GetCurrentPoint(this).Position);
-
-        double dx = currentPointerWorld.X - startPointerWorld.X;
-        double dy = currentPointerWorld.Y - startPointerWorld.Y;
+        Point currentView = e.GetCurrentPoint(this).Position;
+        
+        double dx;
+        double dy;
+        
+        if (_itemsHost is null)
+        {
+            dx = currentView.X - drag.StartPointerView.X;
+            dy = currentView.Y - drag.StartPointerView.Y;
+        }
+        else
+        {
+            GeneralTransform t = TransformToVisual(_itemsHost);
+            Point startHost = t.TransformPoint(drag.StartPointerView);
+            Point currentHost = t.TransformPoint(currentView);
+            
+            dx = currentHost.X - startHost.X;
+            dy = currentHost.Y - startHost.Y;
+        }
 
         SetCanvasLeft(drag.Target, drag.StartLeft + dx);
         SetCanvasTop(drag.Target, drag.StartTop + dy);

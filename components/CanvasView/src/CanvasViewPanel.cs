@@ -48,7 +48,8 @@ namespace CommunityToolkit.WinUI.Controls
         internal event EventHandler? ContentBoundsChanged;
 
         // Used to watch Canvas.Left/Top changes on children and/or their template root.
-        private readonly Dictionary<DependencyObject, (long leftToken, long topToken)> _tokens = new();
+        // We also keep the owning UIElement so we can evaluate whether bounds/extent must expand.
+        private readonly Dictionary<DependencyObject, (UIElement owner, long leftToken, long topToken)> _tokens = new();
 
         private const string PositioningElementPropertyName = "PositioningElement";
 
@@ -235,10 +236,10 @@ namespace CommunityToolkit.WinUI.Controls
                 return;
             }
 
-            long leftToken = RegisterPropertyChangedCallbackSafe(target, Canvas.LeftProperty, () => InvalidateMeasure());
-            long topToken = RegisterPropertyChangedCallbackSafe(target, Canvas.TopProperty, () => InvalidateMeasure());
+            long leftToken = RegisterPropertyChangedCallbackSafe(target, Canvas.LeftProperty, () => OnCanvasPositionChanged(target));
+            long topToken = RegisterPropertyChangedCallbackSafe(target, Canvas.TopProperty, () => OnCanvasPositionChanged(target));
 
-            _tokens[target] = (leftToken, topToken);
+            _tokens[target] = (ownerToInvalidate, leftToken, topToken);
 
             // Cleanup when element is unloaded (best-effort).
             if (target is FrameworkElement fe)
@@ -300,6 +301,43 @@ namespace CommunityToolkit.WinUI.Controls
             }
 
             return value;
+        }
+
+        private void OnCanvasPositionChanged(DependencyObject target)
+        {
+            // We always need to re-arrange so the element moves smoothly.
+            InvalidateArrange();
+
+            // Only re-measure if this move would expand the current content bounds (extent growth).
+            if (!_tokens.TryGetValue(target, out var info))
+            {
+                return;
+            }
+
+            // If bounds are empty/uninitialized, force a measure once.
+            if (_contentBounds == Rect.Empty)
+            {
+                InvalidateMeasure();
+                return;
+            }
+
+            double left = ReadCanvasLeft(target);
+            double top = ReadCanvasTop(target);
+
+                        // Panel arranges the *owner* (container); use its DesiredSize (already measured).
+            Size size = info.owner.DesiredSize;
+            double w = CoerceFiniteNonNegative(size.Width);
+            double h = CoerceFiniteNonNegative(size.Height);
+
+            double minX = _contentBounds.X;
+            double minY = _contentBounds.Y;
+            double maxX = _contentBounds.X + _contentBounds.Width;
+            double maxY = _contentBounds.Y + _contentBounds.Height;
+
+            if (left < minX || top < minY || (left + w) > maxX || (top + h) > maxY)
+                {
+                    InvalidateMeasure();
+                }
         }
     }
 }
