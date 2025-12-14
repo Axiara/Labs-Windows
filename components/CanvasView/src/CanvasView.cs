@@ -5,7 +5,6 @@
 #if NET8_0_OR_GREATER
 using System.Diagnostics.CodeAnalysis;
 #endif
-using CommunityToolkit.WinUI.Helpers;
 
 namespace CommunityToolkit.WinUI.Controls;
 
@@ -43,8 +42,69 @@ public partial class CanvasView : ItemsControl
             new PropertyMetadata(new Point(0, 0)));
 
 
+    /// <summary>
+    /// Controls how CanvasView updates the dragged item's position.
+    /// <list type="bullet">
+    /// <item><see cref="CanvasViewDragPositionUpdateMode.BindingExpression"/> preserves existing bindings by writing to the binding source (reflection-based).</item>
+    /// <item><see cref="CanvasViewDragPositionUpdateMode.DataContextInterface"/> updates <see cref="ICanvasViewPositionable"/> on the DataContext (trim/AOT-friendly).</item>
+    /// <item><see cref="CanvasViewDragPositionUpdateMode.CanvasAttachedProperties"/> writes Canvas.Left/Top directly (may overwrite bindings).</item>
+    /// <item><see cref="CanvasViewDragPositionUpdateMode.Auto"/> prefers the interface path; on WebAssembly it avoids reflection by default.</item>
+    /// </list>
+    /// </summary>
+    public CanvasViewDragPositionUpdateMode DragPositionUpdateMode { get; set; } = CanvasViewDragPositionUpdateMode.Auto;
+
+#if __UNO__
+    // Uno currently doesn't automatically discover default styles from Themes/Generic.xaml in referenced control libraries on all targets
+    // (notably WebAssembly). Ensure the control library's Generic.xaml is merged at runtime as a fallback.
+    // Apps can still explicitly merge the dictionary in App.xaml if they prefer.
+    private static bool _unoResourcesMerged;
+
+    private static void EnsureUnoResourcesMerged()
+    {
+        if (_unoResourcesMerged)
+        {
+            return;
+        }
+
+        try
+        {
+            var app = Application.Current;
+            if (app is null)
+            {
+                return;
+            }
+
+            // If the implicit style is already reachable, nothing to do.
+            if (app.Resources?.ContainsKey(typeof(CanvasView)) == true)
+            {
+                _unoResourcesMerged = true;
+                return;
+            }
+
+            string? assemblyName = typeof(CanvasView).Assembly.GetName().Name;
+            if (string.IsNullOrEmpty(assemblyName))
+            {
+                return;
+            }
+
+            var uri = new global::System.Uri($"ms-appx:///{assemblyName}/Themes/Generic.xaml");
+            app.Resources.MergedDictionaries.Add(new ResourceDictionary { Source = uri });
+
+            _unoResourcesMerged = true;
+        }
+        catch
+        {
+            // Swallow - app can still merge resources manually.
+        }
+    }
+#endif
+
     public CanvasView()
     {
+#if __UNO__
+        EnsureUnoResourcesMerged();
+#endif
+
         // ItemsPanel is provided by the default style in Themes/Generic.xaml.
         // This avoids WinUI 3 runtime XamlReader.Load limitations with custom types.
         DefaultStyleKey = typeof(CanvasView);
@@ -54,16 +114,18 @@ public partial class CanvasView : ItemsControl
     {
         base.PrepareContainerForItemOverride(element, item);
 
-        // ContentPresenter is the default container for Canvas.
+        // ContentPresenter is the default container for CanvasView items.
         if (element is ContentPresenter cp)
         {
-            _ = CompositionTargetHelper.ExecuteAfterCompositionRenderingAsync(() =>
-            {
-                SetupChildBinding(cp);
-            });
+            // We need to wait for the ContentPresenter to realize its template root before we can:
+            //  - lift Canvas.(Left/Top/ZIndex) from the template root onto the container
+            //  - hook drag handlers on the template root
+            //
+            // CompositionTarget-based scheduling is not reliable across all Uno targets (e.g. WebAssembly),
+            // so we use LayoutUpdated as a cross-platform "template realized" signal.
+            EnsureChildBinding(cp);
 
-            // Loaded is not firing when dynamically loading an element to the collection. Relay on CompositionTargetHelper above.
-            // Seems like a bug in Loaded event?
+            // Loaded still helps on Windows, but isn't always raised reliably for dynamically added items.
             cp.Loaded += ContentPresenter_Loaded;
         }
 
@@ -76,6 +138,9 @@ public partial class CanvasView : ItemsControl
 
         if (element is ContentPresenter cp)
         {
+            _pendingChildBindings.Remove(cp);
+            cp.LayoutUpdated -= ContentPresenter_LayoutUpdated;
+
             if (CanvasViewPanel.GetPositioningElement(cp) is UIElement root)
             {
                 UnhookDragHandlers(root);
@@ -91,17 +156,45 @@ public partial class CanvasView : ItemsControl
         {
             cp.Loaded -= ContentPresenter_Loaded;
 
-            SetupChildBinding(cp);
+            EnsureChildBinding(cp);
         }
     }
 
-    private void SetupChildBinding(ContentPresenter cp)
+    private void EnsureChildBinding(ContentPresenter cp)
+    {
+        // If the template root is ready, bind + hook immediately.
+        if (TrySetupChildBinding(cp))
+        {
+            _pendingChildBindings.Remove(cp);
+            cp.LayoutUpdated -= ContentPresenter_LayoutUpdated;
+            return;
+        }
+
+        // Otherwise, schedule a retry after the next layout pass.
+        if (_pendingChildBindings.Add(cp))
+        {
+            cp.LayoutUpdated += ContentPresenter_LayoutUpdated;
+        }
+    }
+
+    private void ContentPresenter_LayoutUpdated(object? sender, object e)
+    {
+        if (sender is ContentPresenter cp)
+        {
+            cp.LayoutUpdated -= ContentPresenter_LayoutUpdated;
+            _pendingChildBindings.Remove(cp);
+
+            // Try again now that layout has progressed.
+            EnsureChildBinding(cp);
+        }
+    }
+
+    private bool TrySetupChildBinding(ContentPresenter cp)
     {
         int count = VisualTreeHelper.GetChildrenCount(cp);
         if (count <= 0)
         {
-            _ = CompositionTargetHelper.ExecuteAfterCompositionRenderingAsync(() => SetupChildBinding(cp));
-            return;
+            return false;
         }
 
         DependencyObject child = VisualTreeHelper.GetChild(cp, 0);
@@ -126,7 +219,8 @@ public partial class CanvasView : ItemsControl
 
             cp.SetBinding(prop, binding);
         }
-        
+
+        return true;
     }
 
     private sealed class DragSession
@@ -147,6 +241,7 @@ public partial class CanvasView : ItemsControl
 
     private readonly HashSet<UIElement> _dragTargets = new();
     private readonly Dictionary<uint, DragSession> _drags = new();
+    private readonly HashSet<ContentPresenter> _pendingChildBindings = new();
 
     private void HookDragHandlers(UIElement root)
     {
@@ -230,34 +325,86 @@ public partial class CanvasView : ItemsControl
         return double.IsNaN(value) ? 0 : value;
     }
 
-#if NET8_0_OR_GREATER
-    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "These uses of 'SetBindingExpressionValue' might be fine (we should revisit this later)")]
-#endif
-    private static void SetCanvasLeft(UIElement element, double value)
+    private static bool TryUpdatePositionableDataItem(FrameworkElement fe, double left, double top)
     {
-        if (element is FrameworkElement fe)
+        if (fe.DataContext is ICanvasViewPositionable ctx)
         {
-            fe.SetBindingExpressionValue(Canvas.LeftProperty, value);
+            ctx.X = left;
+            ctx.Y = top;
+            return true;
         }
-        else
+
+        // Also support ElementName / RelativeSource bindings where DataItem isn't the DataContext.
+        var leftBinding = fe.GetBindingExpression(Canvas.LeftProperty);
+        if (leftBinding?.DataItem is FrameworkElement subfe)
         {
-            Canvas.SetLeft(element, value);
+            if (subfe.DataContext is ICanvasViewPositionable subctx)
+            {
+                subctx.X = left;
+                subctx.Y = top;
+                return true;
+            }
         }
+        else if (leftBinding?.DataItem is ICanvasViewPositionable dataItem)
+        {
+            dataItem.X = left;
+            dataItem.Y = top;
+            return true;
+        }
+
+        return false;
     }
 
 #if NET8_0_OR_GREATER
-    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "These uses of 'SetBindingExpressionValue' might be fine (we should revisit this later)")]
+    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "BindingExpression-based dragging updates the source via reflection. Prefer DragPositionUpdateMode=DataContextInterface for trim/AOT targets.")]
 #endif
-    private static void SetCanvasTop(UIElement element, double value)
+    private void SetCanvasPosition(UIElement element, double left, double top)
     {
+        // Prefer trim/AOT-friendly updates when possible.
         if (element is FrameworkElement fe)
         {
-            fe.SetBindingExpressionValue(Canvas.TopProperty, value);
+            switch (DragPositionUpdateMode)
+            {
+                case CanvasViewDragPositionUpdateMode.DataContextInterface:
+                    if (TryUpdatePositionableDataItem(fe, left, top))
+                    {
+                        return;
+                    }
+                    break;
+
+                case CanvasViewDragPositionUpdateMode.BindingExpression:
+                    fe.SetBindingExpressionValue(Canvas.LeftProperty, left);
+                    fe.SetBindingExpressionValue(Canvas.TopProperty, top);
+                    return;
+
+                case CanvasViewDragPositionUpdateMode.CanvasAttachedProperties:
+                    Canvas.SetLeft(fe, left);
+                    Canvas.SetTop(fe, top);
+                    return;
+
+                case CanvasViewDragPositionUpdateMode.Auto:
+                default:
+                    if (TryUpdatePositionableDataItem(fe, left, top))
+                    {
+                        return;
+                    }
+
+#if __WASM__
+                    // WebAssembly builds are commonly trimmed/AOT; avoid reflection by default.
+                    Canvas.SetLeft(fe, left);
+                    Canvas.SetTop(fe, top);
+                    return;
+#else
+                    fe.SetBindingExpressionValue(Canvas.LeftProperty, left);
+                    fe.SetBindingExpressionValue(Canvas.TopProperty, top);
+                    return;
+#endif
+            }
         }
-        else
-        {
-            Canvas.SetTop(element, value);
-        }
+
+        // Fallback for non-FrameworkElement (rare).
+        Canvas.SetLeft(element, left);
+        Canvas.SetTop(element, top);
     }
 
     private void OnItemPointerPressed(object sender, PointerRoutedEventArgs e)
@@ -269,8 +416,8 @@ public partial class CanvasView : ItemsControl
 
         var point = e.GetCurrentPoint(this);
 
-        // Require left button/primary contact.
-        if (!point.Properties.IsLeftButtonPressed)
+        // Require left button (mouse) OR an in-contact pointer (touch/pen).
+        if (!point.Properties.IsLeftButtonPressed && !point.IsInContact)
         {
             return;
         }
@@ -314,8 +461,10 @@ public partial class CanvasView : ItemsControl
             dy = currentHost.Y - startHost.Y;
         }
 
-        SetCanvasLeft(drag.Target, drag.StartLeft + dx);
-        SetCanvasTop(drag.Target, drag.StartTop + dy);
+        SetCanvasPosition(drag.Target, drag.StartLeft + dx, drag.StartTop + dy);
+
+        // Ensure extents update even on platforms where DP change callbacks aren't supported.
+        _itemsHost?.InvalidateMeasure();
 
         e.Handled = true;
     }
