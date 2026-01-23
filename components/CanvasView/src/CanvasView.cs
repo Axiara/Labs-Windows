@@ -29,6 +29,48 @@ public partial class CanvasView : ItemsControl
     private readonly Dictionary<uint, DragSession> _drags = new();
     private CanvasViewPanel? _itemsHost;
 
+#if __UNO__
+    private static bool s_unoResourcesMerged;
+
+    private static void EnsureUnoResourcesMerged()
+    {
+        if (s_unoResourcesMerged)
+        {
+            return;
+        }
+
+        try
+        {
+            var app = Application.Current;
+            if (app is null)
+            {
+                return;
+            }
+
+            if (app.Resources?.ContainsKey(typeof(CanvasView)) == true)
+            {
+                s_unoResourcesMerged = true;
+                return;
+            }
+
+            string? assemblyName = typeof(CanvasView).Assembly.GetName().Name;
+            if (string.IsNullOrEmpty(assemblyName))
+            {
+                return;
+            }
+
+            var uri = new global::System.Uri($"ms-appx:///{assemblyName}/Themes/Generic.xaml");
+            app.Resources.MergedDictionaries.Add(new ResourceDictionary { Source = uri });
+
+            s_unoResourcesMerged = true;
+        }
+        catch
+        {
+            // Swallow - app can still merge resources manually.
+        }
+    }
+#endif
+
     /// <summary>
     /// Gets the bounding rectangle of all children in canvas coordinates.
     /// </summary>
@@ -62,10 +104,30 @@ public partial class CanvasView : ItemsControl
             new PropertyMetadata(new Point(0, 0)));
 
     /// <summary>
+    /// Gets or sets how <see cref="CanvasView"/> updates the dragged item's position.
+    /// </summary>
+    /// <remarks>
+    /// <list type="bullet">
+    /// <item><see cref="CanvasViewDragPositionUpdateMode.Auto"/> prefers the interface path;
+    /// on WebAssembly it avoids reflection by default.</item>
+    /// <item><see cref="CanvasViewDragPositionUpdateMode.DataContextInterface"/> updates
+    /// <see cref="ICanvasViewPositionable"/> on the DataContext (trim/AOT-friendly).</item>
+    /// <item><see cref="CanvasViewDragPositionUpdateMode.BindingExpression"/> preserves existing
+    /// bindings by writing to the binding source (reflection-based).</item>
+    /// <item><see cref="CanvasViewDragPositionUpdateMode.CanvasAttachedProperties"/> writes
+    /// Canvas.Left/Top directly (may overwrite bindings).</item>
+    /// </list>
+    /// </remarks>
+    public CanvasViewDragPositionUpdateMode DragPositionUpdateMode { get; set; } = CanvasViewDragPositionUpdateMode.Auto;
+
+    /// <summary>
     /// Initializes a new instance of the <see cref="CanvasView"/> class.
     /// </summary>
     public CanvasView()
     {
+#if __UNO__
+        EnsureUnoResourcesMerged();
+#endif
         // ItemsPanel is provided by the default style in Themes/Generic.xaml.
         // This avoids WinUI 3 runtime XamlReader.Load limitations with custom types.
         DefaultStyleKey = typeof(CanvasView);
@@ -338,16 +400,81 @@ public partial class CanvasView : ItemsControl
         }
     }
 
+    private static bool TryUpdatePositionableDataItem(FrameworkElement fe, double left, double top)
+    {
+        if (fe.DataContext is ICanvasViewPositionable ctx)
+        {
+            ctx.X = left;
+            ctx.Y = top;
+            return true;
+        }
+
+        // Also support ElementName/RelativeSource bindings where DataItem isn't the DataContext.
+        var leftBinding = fe.GetBindingExpression(Canvas.LeftProperty);
+        if (leftBinding?.DataItem is FrameworkElement subfe)
+        {
+            if (subfe.DataContext is ICanvasViewPositionable subctx)
+            {
+                subctx.X = left;
+                subctx.Y = top;
+                return true;
+            }
+        }
+        else if (leftBinding?.DataItem is ICanvasViewPositionable dataItem)
+        {
+            dataItem.X = left;
+            dataItem.Y = top;
+            return true;
+        }
+
+        return false;
+    }
+
 #if NET8_0_OR_GREATER
-    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "SetBindingExpressionValue uses reflection; prefer ICanvasViewPositionable for trim/AOT.")]
+    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "BindingExpression-based dragging updates the source via reflection. Prefer DragPositionUpdateMode=DataContextInterface for trim/AOT targets.")]
 #endif
     private void SetCanvasPosition(UIElement element, double left, double top)
     {
         if (element is FrameworkElement fe)
         {
-            fe.SetBindingExpressionValue(Canvas.LeftProperty, left);
-            fe.SetBindingExpressionValue(Canvas.TopProperty, top);
-            return;
+            switch (DragPositionUpdateMode)
+            {
+                case CanvasViewDragPositionUpdateMode.DataContextInterface:
+                    if (TryUpdatePositionableDataItem(fe, left, top))
+                    {
+                        return;
+                    }
+
+                    break;
+
+                case CanvasViewDragPositionUpdateMode.BindingExpression:
+                    fe.SetBindingExpressionValue(Canvas.LeftProperty, left);
+                    fe.SetBindingExpressionValue(Canvas.TopProperty, top);
+                    return;
+
+                case CanvasViewDragPositionUpdateMode.CanvasAttachedProperties:
+                    Canvas.SetLeft(fe, left);
+                    Canvas.SetTop(fe, top);
+                    return;
+
+                case CanvasViewDragPositionUpdateMode.Auto:
+                default:
+                    if (TryUpdatePositionableDataItem(fe, left, top))
+                    {
+                        return;
+                    }
+
+#if __WASM__
+                    // WebAssembly builds are commonly trimmed/AOT; avoid reflection by default.
+                    Canvas.SetLeft(fe, left);
+                    Canvas.SetTop(fe, top);
+                    return;
+#else
+                    fe.SetBindingExpressionValue(Canvas.LeftProperty, left);
+                    fe.SetBindingExpressionValue(Canvas.TopProperty, top);
+                    return;
+#endif
+            }
         }
 
         // Fallback for non-FrameworkElement.

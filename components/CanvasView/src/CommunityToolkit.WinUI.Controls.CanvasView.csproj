@@ -19,4 +19,9 @@
   <PropertyGroup Condition="'$(IsWinAppSdk)' == 'true'">
     <DefineConstants>$(DefineConstants);WINAPPSDK</DefineConstants>
   </PropertyGroup>
+
+  <!-- Uno WinUI 3 uses Microsoft.UI.Xaml but does not set IsWinAppSdk. Ensure WINAPPSDK is defined. -->
+  <PropertyGroup Condition="'$(IsUno)' == 'true' AND '$(WinUIMajorVersion)' == '3'">
+    <DefineConstants>$(DefineConstants);WINAPPSDK</DefineConstants>
+  </PropertyGroup>
 </Project>
