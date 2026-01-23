@@ -25,6 +25,8 @@ public partial class CanvasView : ItemsControl
     };
 
     private readonly HashSet<ContentPresenter> _pendingChildBindings = new();
+    private readonly HashSet<UIElement> _dragTargets = new();
+    private readonly Dictionary<uint, DragSession> _drags = new();
     private CanvasViewPanel? _itemsHost;
 
     /// <summary>
@@ -84,6 +86,7 @@ public partial class CanvasView : ItemsControl
         if (_itemsHost is not null)
         {
             _itemsHost.ContentBoundsChanged += OnHostBoundsChanged;
+            _itemsHost.Clip = null; // Ensure no content-anchored clip
             SyncBoundsFromHost();
         }
     }
@@ -95,10 +98,8 @@ public partial class CanvasView : ItemsControl
 
         if (element is ContentPresenter cp)
         {
-            // Use LayoutUpdated as a cross-platform signal that the template root is realized.
             EnsureChildBinding(cp);
             cp.Loaded += ContentPresenter_Loaded;
-            cp.ManipulationDelta += ContentPresenter_ManipulationDelta;
         }
     }
 
@@ -112,7 +113,11 @@ public partial class CanvasView : ItemsControl
             _pendingChildBindings.Remove(cp);
             cp.LayoutUpdated -= ContentPresenter_LayoutUpdated;
             cp.Loaded -= ContentPresenter_Loaded;
-            cp.ManipulationDelta -= ContentPresenter_ManipulationDelta;
+
+            if (CanvasViewPanel.GetPositioningElement(cp) is UIElement root)
+            {
+                UnhookDragHandlers(root);
+            }
         }
     }
 
@@ -163,6 +168,11 @@ public partial class CanvasView : ItemsControl
         // Tell the items host to read Canvas.Left/Top from the template root.
         CanvasViewPanel.SetPositioningElement(cp, child);
 
+        if (child is UIElement root)
+        {
+            HookDragHandlers(root);
+        }
+
         // Hook up lifted properties from the template child to the container.
         foreach ((var prop, var path) in _liftedProperties)
         {
@@ -177,17 +187,175 @@ public partial class CanvasView : ItemsControl
         return true;
     }
 
+    #region Drag Handling
+
+    private sealed class DragSession
+    {
+        public DragSession(UIElement target, Point startPointerView, double startLeft, double startTop)
+        {
+            Target = target;
+            StartPointerView = startPointerView;
+            StartLeft = startLeft;
+            StartTop = startTop;
+        }
+
+        public UIElement Target { get; }
+        public Point StartPointerView { get; }
+        public double StartLeft { get; }
+        public double StartTop { get; }
+    }
+
+    private void HookDragHandlers(UIElement root)
+    {
+        if (!_dragTargets.Add(root))
+        {
+            return;
+        }
+
+        root.PointerPressed += OnItemPointerPressed;
+        root.PointerMoved += OnItemPointerMoved;
+        root.PointerReleased += OnItemPointerReleased;
+        root.PointerCanceled += OnItemPointerCanceled;
+        root.PointerCaptureLost += OnItemPointerCaptureLost;
+
+        if (root is FrameworkElement fe)
+        {
+            fe.Unloaded += OnItemUnloaded;
+        }
+    }
+
+    private void UnhookDragHandlers(UIElement root)
+    {
+        if (!_dragTargets.Remove(root))
+        {
+            return;
+        }
+
+        root.PointerPressed -= OnItemPointerPressed;
+        root.PointerMoved -= OnItemPointerMoved;
+        root.PointerReleased -= OnItemPointerReleased;
+        root.PointerCanceled -= OnItemPointerCanceled;
+        root.PointerCaptureLost -= OnItemPointerCaptureLost;
+
+        if (root is FrameworkElement fe)
+        {
+            fe.Unloaded -= OnItemUnloaded;
+        }
+    }
+
+    private void OnItemUnloaded(object sender, RoutedEventArgs e)
+    {
+        if (sender is UIElement root)
+        {
+            UnhookDragHandlers(root);
+        }
+    }
+
+    private static double ReadCanvasLeft(UIElement element)
+    {
+        double value = Canvas.GetLeft(element);
+        return double.IsNaN(value) ? 0 : value;
+    }
+
+    private static double ReadCanvasTop(UIElement element)
+    {
+        double value = Canvas.GetTop(element);
+        return double.IsNaN(value) ? 0 : value;
+    }
+
+    private void OnItemPointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (sender is not UIElement target)
+        {
+            return;
+        }
+
+        var point = e.GetCurrentPoint(this);
+
+        // Require left button (mouse) or in-contact pointer (touch/pen).
+        if (!point.Properties.IsLeftButtonPressed && !point.IsInContact)
+        {
+            return;
+        }
+
+        target.CapturePointer(e.Pointer);
+
+        Point startPointerView = point.Position;
+        double startLeft = ReadCanvasLeft(target);
+        double startTop = ReadCanvasTop(target);
+
+        _drags[e.Pointer.PointerId] = new DragSession(target, startPointerView, startLeft, startTop);
+        e.Handled = true;
+    }
+
+    private void OnItemPointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_drags.TryGetValue(e.Pointer.PointerId, out DragSession? drag))
+        {
+            return;
+        }
+
+        Point currentView = e.GetCurrentPoint(this).Position;
+
+        double dx;
+        double dy;
+
+        if (_itemsHost is null)
+        {
+            dx = currentView.X - drag.StartPointerView.X;
+            dy = currentView.Y - drag.StartPointerView.Y;
+        }
+        else
+        {
+            // Transform to host coordinates to account for zoom/pan.
+            GeneralTransform t = TransformToVisual(_itemsHost);
+            Point startHost = t.TransformPoint(drag.StartPointerView);
+            Point currentHost = t.TransformPoint(currentView);
+
+            dx = currentHost.X - startHost.X;
+            dy = currentHost.Y - startHost.Y;
+        }
+
+        SetCanvasPosition(drag.Target, drag.StartLeft + dx, drag.StartTop + dy);
+
+        // Ensure extent updates for platforms where DP change callbacks may not fire.
+        _itemsHost?.InvalidateMeasure();
+
+        e.Handled = true;
+    }
+
+    private void OnItemPointerReleased(object sender, PointerRoutedEventArgs e) => EndDrag(e);
+    private void OnItemPointerCanceled(object sender, PointerRoutedEventArgs e) => EndDrag(e);
+    private void OnItemPointerCaptureLost(object sender, PointerRoutedEventArgs e) => EndDrag(e);
+
+    private void EndDrag(PointerRoutedEventArgs e)
+    {
+        if (_drags.TryGetValue(e.Pointer.PointerId, out DragSession? drag))
+        {
+            drag.Target.ReleasePointerCapture(e.Pointer);
+            _drags.Remove(e.Pointer.PointerId);
+            _itemsHost?.InvalidateMeasure();
+        }
+    }
+
 #if NET8_0_OR_GREATER
     [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "SetBindingExpressionValue uses reflection; prefer ICanvasViewPositionable for trim/AOT.")]
 #endif
-    private void ContentPresenter_ManipulationDelta(object sender, ManipulationDeltaRoutedEventArgs e)
+    private void SetCanvasPosition(UIElement element, double left, double top)
     {
-        if (sender is ContentPresenter cp)
+        if (element is FrameworkElement fe)
         {
-            cp.SetBindingExpressionValue(Canvas.LeftProperty, Canvas.GetLeft(cp) + e.Delta.Translation.X);
-            cp.SetBindingExpressionValue(Canvas.TopProperty, Canvas.GetTop(cp) + e.Delta.Translation.Y);
+            fe.SetBindingExpressionValue(Canvas.LeftProperty, left);
+            fe.SetBindingExpressionValue(Canvas.TopProperty, top);
+            return;
         }
+
+        // Fallback for non-FrameworkElement.
+        Canvas.SetLeft(element, left);
+        Canvas.SetTop(element, top);
     }
+
+    #endregion
 
     private void OnHostBoundsChanged(object? sender, EventArgs e) => SyncBoundsFromHost();
 
