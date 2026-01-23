@@ -130,4 +130,25 @@ public partial class ExampleCanvasViewTestClass : VisualUITestBase
 
         Assert.IsFalse(component.IsLoaded);
     }
+
+    [UIThreadTestMethod]
+    public async Task CanvasView_UsesCanvasViewPanelItemsHost()
+    {
+        var component = new CanvasView();
+        component.Items.Add(new Border { Width = 10, Height = 10 });
+
+        await LoadTestContentAsync(component);
+
+        try
+        {
+            await CompositionTargetHelper.ExecuteAfterCompositionRenderingAsync(() => { });
+
+            var itemsHost = component.FindDescendant<CanvasViewPanel>();
+            Assert.IsNotNull(itemsHost, "CanvasViewPanel items host was not found. Ensure the default style is applied and sets ItemsPanel to CanvasViewPanel.");
+        }
+        finally
+        {
+            await UnloadTestContentAsync(component);
+        }
+    }
 }
