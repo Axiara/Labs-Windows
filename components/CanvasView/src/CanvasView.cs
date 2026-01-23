@@ -5,77 +5,114 @@
 #if NET8_0_OR_GREATER
 using System.Diagnostics.CodeAnalysis;
 #endif
-using CommunityToolkit.WinUI.Helpers;
+using System.Collections.Generic;
 
 namespace CommunityToolkit.WinUI.Controls;
 
 /// <summary>
-/// <see cref="CanvasView"/> is an <see cref="ItemsControl"/> which uses a <see cref="Canvas"/> for the layout of its items.
-/// It which provides built-in support for presenting a collection of items bound to specific coordinates 
-/// and drag-and-drop support of those items.
+/// <see cref="CanvasView"/> is an <see cref="ItemsControl"/> which uses a <see cref="CanvasViewPanel"/>
+/// for the layout of its items. It provides built-in support for presenting a collection of items
+/// bound to specific coordinates and drag-and-drop support of those items.
 /// </summary>
 public partial class CanvasView : ItemsControl
 {
-    private (DependencyProperty, string)[] LiftedProperties = new (DependencyProperty, string)[] {
+    private readonly (DependencyProperty, string)[] _liftedProperties = new (DependencyProperty, string)[]
+    {
         (Canvas.LeftProperty, "(Canvas.Left)"),
         (Canvas.TopProperty, "(Canvas.Top)"),
         (Canvas.ZIndexProperty, "(Canvas.ZIndex)"),
         (ManipulationModeProperty, "ManipulationMode")
     };
 
-    public CanvasView()
+    private readonly HashSet<ContentPresenter> _pendingChildBindings = new();
+    private CanvasViewPanel? _itemsHost;
+
+    /// <summary>
+    /// Gets the bounding rectangle of all children in canvas coordinates.
+    /// </summary>
+    public Rect ContentBounds
     {
-        // TODO: Need to use XamlReader because of https://github.com/microsoft/microsoft-ui-xaml/issues/2898
-        ItemsPanel = XamlReader.Load("<ItemsPanelTemplate xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\"><Canvas/></ItemsPanelTemplate>") as ItemsPanelTemplate;
+        get => (Rect)GetValue(ContentBoundsProperty);
+        private set => SetValue(ContentBoundsProperty, value);
     }
 
+    /// <summary>
+    /// Identifies the <see cref="ContentBounds"/> dependency property.
+    /// </summary>
+    public static readonly DependencyProperty ContentBoundsProperty =
+        DependencyProperty.Register(nameof(ContentBounds), typeof(Rect), typeof(CanvasView),
+            new PropertyMetadata(new Rect(0, 0, 0, 0)));
+
+    /// <summary>
+    /// Gets the offset applied to shift negative coordinates into positive space.
+    /// </summary>
+    public Point ContentOffset
+    {
+        get => (Point)GetValue(ContentOffsetProperty);
+        private set => SetValue(ContentOffsetProperty, value);
+    }
+
+    /// <summary>
+    /// Identifies the <see cref="ContentOffset"/> dependency property.
+    /// </summary>
+    public static readonly DependencyProperty ContentOffsetProperty =
+        DependencyProperty.Register(nameof(ContentOffset), typeof(Point), typeof(CanvasView),
+            new PropertyMetadata(new Point(0, 0)));
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="CanvasView"/> class.
+    /// </summary>
+    public CanvasView()
+    {
+        // ItemsPanel is provided by the default style in Themes/Generic.xaml.
+        // This avoids WinUI 3 runtime XamlReader.Load limitations with custom types.
+        DefaultStyleKey = typeof(CanvasView);
+    }
+
+    /// <inheritdoc/>
+    protected override void OnApplyTemplate()
+    {
+        base.OnApplyTemplate();
+
+        if (_itemsHost is not null)
+        {
+            _itemsHost.ContentBoundsChanged -= OnHostBoundsChanged;
+        }
+
+        _itemsHost = FindDescendant<CanvasViewPanel>(this);
+
+        if (_itemsHost is not null)
+        {
+            _itemsHost.ContentBoundsChanged += OnHostBoundsChanged;
+            SyncBoundsFromHost();
+        }
+    }
+
+    /// <inheritdoc/>
     protected override void PrepareContainerForItemOverride(DependencyObject element, object item)
     {
         base.PrepareContainerForItemOverride(element, item);
 
-        // ContentPresenter is the default container for Canvas.
         if (element is ContentPresenter cp)
         {
-            _ = CompositionTargetHelper.ExecuteAfterCompositionRenderingAsync(() =>
-            {
-                SetupChildBinding(cp);
-            });
-
-            // Loaded is not firing when dynamically loading an element to the collection. Relay on CompositionTargetHelper above.
-            // Seems like a bug in Loaded event?
+            // Use LayoutUpdated as a cross-platform signal that the template root is realized.
+            EnsureChildBinding(cp);
             cp.Loaded += ContentPresenter_Loaded;
             cp.ManipulationDelta += ContentPresenter_ManipulationDelta;
         }
-
-        // TODO: Do we want to support something else in a custom template?? else if (item is FrameworkElement fe && fe.FindDescendant/GetContentControl?)
     }
 
+    /// <inheritdoc/>
     protected override void ClearContainerForItemOverride(DependencyObject element, object item)
     {
         base.ClearContainerForItemOverride(element, item);
 
         if (element is ContentPresenter cp)
         {
+            _pendingChildBindings.Remove(cp);
+            cp.LayoutUpdated -= ContentPresenter_LayoutUpdated;
             cp.Loaded -= ContentPresenter_Loaded;
             cp.ManipulationDelta -= ContentPresenter_ManipulationDelta;
-        }
-    }
-
-#if NET8_0_OR_GREATER
-    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "These use of 'SetBindingExpressionValue' might be fine (we should revisit this later)")]
-#endif
-    private void ContentPresenter_ManipulationDelta(object sender, ManipulationDeltaRoutedEventArgs e)
-    {
-        // Move the rectangle.
-        if (sender is ContentPresenter cp)
-        {
-            // TODO: Seeing some drift, not sure if due to DPI or just general drift
-            // or probably we need to do the start/from delta approach we did with SizerBase to resolve.
-
-            // We know that most likely these values have been bound to a data model object of some sort
-            // Therefore, we need to use this helper to update the underlying model value of our bound property.
-            cp.SetBindingExpressionValue(Canvas.LeftProperty, Canvas.GetLeft(cp) + e.Delta.Translation.X);
-            cp.SetBindingExpressionValue(Canvas.TopProperty, Canvas.GetTop(cp) + e.Delta.Translation.Y);
         }
     }
 
@@ -84,30 +121,105 @@ public partial class CanvasView : ItemsControl
         if (sender is ContentPresenter cp)
         {
             cp.Loaded -= ContentPresenter_Loaded;
-
-            SetupChildBinding(cp);
+            EnsureChildBinding(cp);
         }
     }
 
-    private void SetupChildBinding(ContentPresenter cp)
+    private void EnsureChildBinding(ContentPresenter cp)
     {
-        // Get direct visual descendant for ContentPresenter to look for Canvas properties within Template.
-        var child = VisualTreeHelper.GetChild(cp, 0);
-
-        if (child != null)
+        if (TrySetupChildBinding(cp))
         {
-            // TODO: Should we avoid doing this twice?
+            _pendingChildBindings.Remove(cp);
+            cp.LayoutUpdated -= ContentPresenter_LayoutUpdated;
+            return;
+        }
 
-            // Hook up any properties we care about from the templated children to it's parent ContentPresenter.
-            foreach ((var prop, var path) in LiftedProperties)
+        if (_pendingChildBindings.Add(cp))
+        {
+            cp.LayoutUpdated += ContentPresenter_LayoutUpdated;
+        }
+    }
+
+    private void ContentPresenter_LayoutUpdated(object? sender, object e)
+    {
+        if (sender is ContentPresenter cp)
+        {
+            cp.LayoutUpdated -= ContentPresenter_LayoutUpdated;
+            _pendingChildBindings.Remove(cp);
+            EnsureChildBinding(cp);
+        }
+    }
+
+    private bool TrySetupChildBinding(ContentPresenter cp)
+    {
+        int count = VisualTreeHelper.GetChildrenCount(cp);
+        if (count <= 0)
+        {
+            return false;
+        }
+
+        DependencyObject child = VisualTreeHelper.GetChild(cp, 0);
+
+        // Tell the items host to read Canvas.Left/Top from the template root.
+        CanvasViewPanel.SetPositioningElement(cp, child);
+
+        // Hook up lifted properties from the template child to the container.
+        foreach ((var prop, var path) in _liftedProperties)
+        {
+            var binding = new Binding
             {
-                var binding = new Binding();
-                binding.Source = child;
-                ////binding.Mode = BindingMode.TwoWay; // TODO: Should this be exposed as a general property?
-                binding.Path = new PropertyPath(path);
+                Source = child,
+                Path = new PropertyPath(path)
+            };
+            cp.SetBinding(prop, binding);
+        }
 
-                cp.SetBinding(prop, binding);
+        return true;
+    }
+
+#if NET8_0_OR_GREATER
+    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "SetBindingExpressionValue uses reflection; prefer ICanvasViewPositionable for trim/AOT.")]
+#endif
+    private void ContentPresenter_ManipulationDelta(object sender, ManipulationDeltaRoutedEventArgs e)
+    {
+        if (sender is ContentPresenter cp)
+        {
+            cp.SetBindingExpressionValue(Canvas.LeftProperty, Canvas.GetLeft(cp) + e.Delta.Translation.X);
+            cp.SetBindingExpressionValue(Canvas.TopProperty, Canvas.GetTop(cp) + e.Delta.Translation.Y);
+        }
+    }
+
+    private void OnHostBoundsChanged(object? sender, EventArgs e) => SyncBoundsFromHost();
+
+    private void SyncBoundsFromHost()
+    {
+        if (_itemsHost is null)
+        {
+            return;
+        }
+
+        ContentBounds = _itemsHost.ContentBounds;
+        ContentOffset = _itemsHost.ContentOffset;
+    }
+
+    private static T? FindDescendant<T>(DependencyObject root) where T : DependencyObject
+    {
+        int count = VisualTreeHelper.GetChildrenCount(root);
+        for (int i = 0; i < count; i++)
+        {
+            DependencyObject child = VisualTreeHelper.GetChild(root, i);
+            if (child is T typed)
+            {
+                return typed;
+            }
+
+            T? nested = FindDescendant<T>(child);
+            if (nested is not null)
+            {
+                return nested;
             }
         }
+
+        return default;
     }
 }
